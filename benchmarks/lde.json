@@ -1,0 +1,10 @@
+{
+	"name": "benchmarks",
+	"version": "0.1.0",
+	"description": "HTTP server comparison suite: node, bun, express, superfast, python, lapis",
+	"dependencies": {
+		"process": {
+			"git": "https://github.com/lde-org/process"
+		}
+	}
+}
