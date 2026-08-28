@@ -180,7 +180,7 @@ end
 --- Spawn a server binary, optionally under taskset when PIN is set.
 local function spawnServer(bin, argv, opts)
 	if PIN then
-		return process.spawn("taskset", { "-c", PIN, bin, table.unpack(argv) }, opts)
+		return process.spawn("taskset", { "-c", PIN, bin, unpack(argv) }, opts)
 	end
 	return process.spawn(bin, argv, opts)
 end
@@ -294,6 +294,60 @@ local servers = {
 		start = function(port)
 			return spawnServer("node", { "server.js" }, {
 				cwd = ROOT .. "servers/express",
+				env = { PORT = tostring(port) },
+				stdout = "null", stderr = "pipe",
+			})
+		end,
+	},
+	{
+		name = "elysia", port = PORT_BASE + 6,
+		check = function()
+			if not findBin("bun") then return nil end
+			local f = io.open(ROOT .. "servers/elysia/node_modules/elysia/package.json")
+			if f then f:close() return true end
+			return nil
+		end,
+		start = function(port)
+			return spawnServer("bun", { "server.js" }, {
+				cwd = ROOT .. "servers/elysia",
+				env = { PORT = tostring(port) },
+				stdout = "null", stderr = "pipe",
+			})
+		end,
+	},
+	{
+		name = "hono", port = PORT_BASE + 7,
+		check = function()
+			if not findBin("bun") then return nil end
+			local f = io.open(ROOT .. "servers/hono/node_modules/hono/package.json")
+			if f then f:close() return true end
+			return nil
+		end,
+		start = function(port)
+			return spawnServer("bun", { "server.js" }, {
+				cwd = ROOT .. "servers/hono",
+				env = { PORT = tostring(port) },
+				stdout = "null", stderr = "pipe",
+			})
+		end,
+	},
+	{
+		name = "just-js", port = PORT_BASE + 8,
+		check = function() return findBin("lde") end,
+		start = function(port)
+			return spawnServer("lde", { "run" }, {
+				cwd = ROOT .. "servers/just-js",
+				env = { PORT = tostring(port) },
+				stdout = "null", stderr = "pipe",
+			})
+		end,
+	},
+	{
+		name = "lapis-superfast", port = PORT_BASE + 9,
+		check = function() return findBin("lde") end,
+		start = function(port)
+			return spawnServer("lde", { "run" }, {
+				cwd = ROOT .. "servers/lapis-superfast",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
 			})

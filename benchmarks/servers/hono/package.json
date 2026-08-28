@@ -1,0 +1,8 @@
+{
+	"name": "hono-bench-server",
+	"version": "0.1.0",
+	"private": true,
+	"dependencies": {
+		"hono": "^4.6.0"
+	}
+}

@@ -128,20 +128,30 @@ built by `benchmarks/build.lua` on first run).
 | `python` | `benchmarks/servers/python` | stdlib `http.server`/`ThreadingHTTPServer` |
 | `lapis` | `benchmarks/servers/lapis` | Lua + Lapis CLI on OpenResty (`lapis server`) |
 | `express` | `benchmarks/servers/express` | Node.js + Express |
+| `elysia` | `benchmarks/servers/elysia` | Bun + Elysia |
+| `hono` | `benchmarks/servers/hono` | Bun + Hono |
+| `just-js` | `benchmarks/servers/just-js` | just-js `http/mini.js` (epoll; an lde package — build.lua compiles the v8 runtime) |
+| `lapis-superfast` | `benchmarks/servers/lapis-superfast` | superfast as the HTTP host, lapis Application dispatched manually (an lde package; `lapis` rock dep) |
 
 ```
 cd benchmarks
-lde run                       # all six servers, comparison table
+lde run                       # all servers, comparison table
 SERVERS=node,bun lde run      # subset
 DUR=5 lde run                 # shorter wrk run (default 10s)
 THREADS=4 CONNS=128 lde run   # different load
 PIN=2 lde run                 # pin every server to one CPU
 ```
 
-Setup (one-time): `lde install rocks:lapis` for the lapis CLI, an OpenResty
-install (set `OPENRESTY_PREFIX`, default `~/openresty`) with the lapis rock
-installed into its embedded LuaJIT (`luarocks --lua-version=5.1 --lua-dir=$OPENRESTY_PREFIX/luajit --tree=$OPENRESTY_PREFIX/luajit-rocks install lapis`),
-and `npm install` in `benchmarks/servers/express`.
+Setup (one-time):
+- `lde install rocks:lapis` for the lapis CLI, plus an OpenResty install (set
+  `OPENRESTY_PREFIX`, default `~/openresty`) with the lapis rock installed into
+  its embedded LuaJIT (`luarocks --lua-version=5.1 --lua-dir=$OPENRESTY_PREFIX/luajit --tree=$OPENRESTY_PREFIX/luajit-rocks install lapis`).
+- `npm install` in `benchmarks/servers/{express,elysia,hono}`.
+- just-js compiles its v8 runtime on first run (its `build.lua` fetches the
+  source + prebuilt v8 monolith and runs `make runtime`; a few minutes).
+- `lapis-superfast` pulls the lapis rock automatically (luarocks dep).
+
+Missing runtimes are skipped with a reason instead of failing the run.
 
 Memory columns: `rss` = resident set size of the whole process tree at the end
 of the run; `peak` = highest single-process RSS (VmHWM) during the run.

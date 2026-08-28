@@ -1,0 +1,10 @@
+{
+	"name": "just-js",
+	"version": "0.1.0",
+	"description": "just-js http/mini.js empty-200 server for the benchmarks suite",
+	"dependencies": {
+		"process": {
+			"git": "https://github.com/lde-org/process"
+		}
+	}
+}
