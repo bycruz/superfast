@@ -1,6 +1,2 @@
 target
 lde.lock
-/bench/.tools/
-/bench/servers/lapis/nginx.conf.compiled
-/bench/servers/lapis/logs/
-/bench/servers/lapis/*_temp/

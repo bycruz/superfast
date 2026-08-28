@@ -112,32 +112,42 @@ serves some dumb HTML:
 cd examples/foo && lde run    # http://localhost:8080
 ```
 
-## Benchmark suite (Justfile)
+## Benchmark suite
 
-`just bench` load-tests five HTTP servers with the same empty-200 keep-alive
-workload and prints req/s, latency, errors and memory:
+`benchmarks/` is its own lde package: `cd benchmarks && lde run` load-tests
+every server with the same empty-200 keep-alive workload and prints an ANSI
+comparison table (req/s, latency p50/p99, errors, memory). No shell scripts —
+the runner uses the `process` library to spawn each server and wrk (wrk is
+built by `benchmarks/build.lua` on first run).
 
-| server | runtime |
-|---|---|
-| `node` | Node.js `http` (`bench/servers/node.js`) |
-| `bun` | `Bun.serve` (`bench/servers/bun.js`) |
-| `superfast` | LuaJIT + io_uring (`bench/server.lua`) |
-| `python` | stdlib `http.server`/`ThreadingHTTPServer` (`bench/servers/python.py`) |
-| `lapis` | Lua + Lapis CLI on OpenResty (`bench/servers/lapis/`) |
+| server | folder | runtime |
+|---|---|---|
+| `node` | `benchmarks/servers/node` | Node.js `http` |
+| `bun` | `benchmarks/servers/bun` | `Bun.serve` |
+| `superfast` | `benchmarks/servers/superfast` | LuaJIT + io_uring (an lde package; the runner shells out to `lde run`) |
+| `python` | `benchmarks/servers/python` | stdlib `http.server`/`ThreadingHTTPServer` |
+| `lapis` | `benchmarks/servers/lapis` | Lua + Lapis CLI on OpenResty (`lapis server`) |
+| `express` | `benchmarks/servers/express` | Node.js + Express |
 
 ```
-just deps          # build wrk, install lapis (luarocks), build OpenResty (first run)
-just bench         # all five, comparison table
-just bench-node    # one server
-just DUR=5 bench   # shorter run
-just PIN=2 bench   # pin every server to CPU 2 (single-core comparison)
+cd benchmarks
+lde run                       # all six servers, comparison table
+SERVERS=node,bun lde run      # subset
+DUR=5 lde run                 # shorter wrk run (default 10s)
+THREADS=4 CONNS=128 lde run   # different load
+PIN=2 lde run                 # pin every server to one CPU
 ```
+
+Setup (one-time): `lde install rocks:lapis` for the lapis CLI, an OpenResty
+install (set `OPENRESTY_PREFIX`, default `~/openresty`) with the lapis rock
+installed into its embedded LuaJIT (`luarocks --lua-version=5.1 --lua-dir=$OPENRESTY_PREFIX/luajit --tree=$OPENRESTY_PREFIX/luajit-rocks install lapis`),
+and `npm install` in `benchmarks/servers/express`.
 
 Memory columns: `rss` = resident set size of the whole process tree at the end
 of the run; `peak` = highest single-process RSS (VmHWM) during the run.
 
 Lapis runs under OpenResty with `num_workers = 1` (see
-`bench/servers/lapis/config.lua`) so it is a single-worker server like
+`benchmarks/servers/lapis/config.lua`) so it is a single-worker server like
 superfast. The machine's `powersave` governor drifts with thermal state, so
 re-run and compare ratios rather than absolute numbers.
 
