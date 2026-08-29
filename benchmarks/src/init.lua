@@ -341,18 +341,7 @@ local servers = {
 				stdout = "null", stderr = "pipe",
 			})
 		end,
-	},
-	{
-		name = "lapis-superfast", port = PORT_BASE + 9,
-		check = function() return findBin("lde") end,
-		start = function(port)
-			return spawnServer("lde", { "run" }, {
-				cwd = ROOT .. "servers/lapis-superfast",
-				env = { PORT = tostring(port) },
-				stdout = "null", stderr = "pipe",
-			})
-		end,
-	},
+	}
 }
 
 -- ── run one server ──────────────────────────────────────────────────────────

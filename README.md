@@ -131,7 +131,6 @@ built by `benchmarks/build.lua` on first run).
 | `elysia` | `benchmarks/servers/elysia` | Bun + Elysia |
 | `hono` | `benchmarks/servers/hono` | Bun + Hono |
 | `just-js` | `benchmarks/servers/just-js` | just-js `http/mini.js` (epoll; an lde package — build.lua compiles the v8 runtime) |
-| `lapis-superfast` | `benchmarks/servers/lapis-superfast` | superfast as the HTTP host, lapis Application dispatched manually (an lde package; `lapis` rock dep) |
 
 ```
 cd benchmarks
@@ -149,7 +148,6 @@ Setup (one-time):
 - `npm install` in `benchmarks/servers/{express,elysia,hono}`.
 - just-js compiles its v8 runtime on first run (its `build.lua` fetches the
   source + prebuilt v8 monolith and runs `make runtime`; a few minutes).
-- `lapis-superfast` pulls the lapis rock automatically (luarocks dep).
 
 Missing runtimes are skipped with a reason instead of failing the run.
 
