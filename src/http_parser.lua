@@ -1,31 +1,5 @@
--- A streaming HTTP/1.x request parser for LuaJIT.
---
--- Feed it bytes as they arrive; it fires callbacks as it recognizes
--- request-line/headers, body chunks, and full messages. It is keep-alive and
--- pipelining aware: once a message completes, any leftover bytes are parsed
--- as the next request, and the same parser instance can be reused via reset().
---
--- Hot path / allocation model:
---   * Bytes accumulate in a single growable FFI buffer (allocated once, length
---     tracked explicitly) and are parsed with libc memmem/memchr/memcmp on
---     pointers + offsets — the buffering and the parsing itself create no Lua
---     strings at all.
---   * All per-message state lives in one FFI struct (parser_state), so the
---     hot path does direct memory loads/stores instead of table lookups.
---   * The `req` object is pooled (one per parser) and its string fields are
---     LAZY: `method`, `path`, `query`, `headers`, `body` materialize from the
---     buffer on first access and are cached on the object. The parser's own
---     needs (content-length, connection, transfer-encoding) are read directly
---     from the buffer with byte compares.
---   * LIFETIME CONTRACT: `req` (and its `headers` table) are only valid while
---     the parser callback / server handler is running — the underlying buffer
---     is recycled afterwards. Handlers must be synchronous and must not retain
---     the request object. Materialized string VALUES are safe to keep (they
---     are copies); retaining the request object itself is not.
---
--- The `onBody` callback (when provided) receives materialized body chunks;
--- without it the body stays in the buffer and is only materialized when
--- `req.body` is accessed.
+-- Streaming HTTP/1.x request parser: pipelining and keep-alive aware.
+-- Architecture and the `req` lifetime contract: docs/ARCHITECTURE.md.
 
 local ffi = require("ffi")
 
@@ -75,7 +49,7 @@ local COLON = 58
 local QUESTION = 63
 local COMMA = 44
 
----@class httpParser.Request
+---@class superfast.http.Request
 ---@field method string lazily materialized
 ---@field path string lazily materialized
 ---@field query string lazily materialized
@@ -83,12 +57,25 @@ local COMMA = 44
 ---@field headers table<string,string>|nil lazily materialized
 ---@field keepAlive boolean
 ---@field body string lazily materialized
+---@field __parser superfast.http.Parser owning parser (internal)
 
----@class httpParser.Parser
----@field fbuf cdata growable accumulation buffer
+--- Callbacks and limits for `httpParser.Parser:new`.
+---@class superfast.http.ParserOptions
+---@field onHeadersComplete fun(req: superfast.http.Request)? called once the request line and headers are parsed
+---@field onBody fun(chunk: string)? called for each body chunk (only when set)
+---@field onMessageComplete fun(req: superfast.http.Request)? called when a full message is available
+---@field maxHeaderSize integer? header block limit in bytes (default 65536)
+---@field maxBodySize integer? body limit in bytes (default 16777216)
+---@field bufferSize integer? initial accumulation buffer size (default 65536)
+
+---@class superfast.http.Parser
+---@field owner table? connection owning this parser (server sets it)
+---@field server superfast.Server? server that created this parser
+---@field fbuf superfast.raw.Buffer growable accumulation buffer
 ---@field fbufCap integer
----@field s parser_state hot state (FFI struct)
----@field req httpParser.Request pooled request object
+---@field s superfast.raw.ParserState hot state (FFI struct)
+---@field msgVersion string HTTP minor version of the current message
+---@field req superfast.http.Request pooled request object
 ---@field maxHeaderSize integer
 ---@field maxBodySize integer
 
@@ -97,7 +84,7 @@ Parser.__index = Parser
 
 --- Case-insensitive compare of buffer[off .. off+len-1] against a lowercase
 --- string.
----@param buf cdata char[]
+---@param buf superfast.raw.Buffer
 ---@param off integer
 ---@param len integer
 ---@param s string lowercase needle
@@ -114,7 +101,7 @@ end
 
 --- Does the header value in buffer[off .. off+len) contain `token` (lowercase)
 --- as a comma-separated token?
----@param buf cdata char[]
+---@param buf superfast.raw.Buffer
 ---@param off integer
 ---@param len integer
 ---@param token string lowercase needle
@@ -146,9 +133,9 @@ end
 
 -- ── lazy request object ─────────────────────────────────────────────────────
 
----@param req httpParser.Request
+---@param req superfast.http.Request
 ---@param k string
----@param ptr cdata
+---@param ptr superfast.raw.Buffer
 ---@param len integer
 local function materialize(req, k, ptr, len)
 	rawset(req, k, ffi.string(ptr, len))
@@ -157,8 +144,8 @@ local function materialize(req, k, ptr, len)
 end
 
 --- Materialize the full headers table from the buffered head.
----@param req httpParser.Request
----@param p httpParser.Parser
+---@param req superfast.http.Request
+---@param p superfast.http.Parser
 ---@return table<string,string>
 local function buildHeaders(req, p)
 	local s = p.s
@@ -223,16 +210,15 @@ end
 
 -- ── parser state machine ────────────────────────────────────────────────────
 
----@param opts table? { onHeadersComplete?, onBody?, onMessageComplete?,
----                     maxHeaderSize?, maxBodySize?, bufferSize? }
----@return httpParser.Parser
+---@param opts superfast.http.ParserOptions?
+---@return superfast.http.Parser
 function Parser:new(opts)
 	opts = opts or {}
 	local cap = opts.bufferSize or 65536
 	local p = {
-		fbuf          = ffi.new("char[?]", cap),
+		fbuf          = ffi.new("char[?]", cap) --[[@as superfast.raw.Buffer]],
 		fbufCap       = cap,
-		s             = ffi.new("parser_state"),
+		s             = ffi.new("parser_state") --[[@as superfast.raw.ParserState]],
 		msgVersion    = "1.1",
 		maxHeaderSize = opts.maxHeaderSize or 65536,
 		maxBodySize   = opts.maxBodySize or 16777216,
@@ -249,7 +235,7 @@ function Parser:new(opts)
 	return setmetatable(p, Parser)
 end
 
----@return httpParser.Parser
+---@return superfast.http.Parser
 function Parser:reset()
 	local s = self.s
 	s.fbufLen = 0
@@ -262,15 +248,15 @@ function Parser:reset()
 end
 
 --- Append n bytes from ptr into the accumulation buffer, growing it on demand.
----@param self httpParser.Parser
----@param ptr cdata
+---@param self superfast.http.Parser
+---@param ptr string|superfast.raw.Ptr
 ---@param n integer
 local function append(self, ptr, n)
 	local s = self.s
 	local need = s.fbufLen + n
 	if need > self.fbufCap then
 		local newCap = math.max(self.fbufCap * 2, need)
-		local newBuf = ffi.new("char[?]", newCap)
+		local newBuf = ffi.new("char[?]", newCap) --[[@as superfast.raw.Buffer]]
 		ffi.copy(newBuf, self.fbuf, s.fbufLen)
 		self.fbuf = newBuf
 		self.fbufCap = newCap
@@ -280,7 +266,7 @@ local function append(self, ptr, n)
 end
 
 --- Drop the first n bytes, shifting any leftover to the front of the buffer.
----@param self httpParser.Parser
+---@param self superfast.http.Parser
 ---@param n integer
 local function consume(self, n)
 	local s = self.s
@@ -292,7 +278,7 @@ end
 
 --- Scan the buffered head, recording lazy ranges + the fields the parser
 --- itself needs. Returns an error string or nil.
----@param p httpParser.Parser
+---@param p superfast.http.Parser
 ---@param headLen integer
 ---@return string|nil
 local function parseHead(p, headLen)
@@ -479,7 +465,7 @@ function Parser:parse()
 end
 
 --- Feed bytes from a cdata buffer (e.g. a recv buffer) — no copy.
----@param ptr cdata char*
+---@param ptr superfast.raw.Buffer char*
 ---@param n integer
 ---@return boolean|nil, string?
 function Parser:feedPtr(ptr, n)
@@ -497,4 +483,8 @@ function Parser:feed(chunk)
 	return self:parse()
 end
 
-return Parser
+--- The parser module: the `Parser` class itself.
+---@type superfast.http.Parser
+local httpParser = Parser
+
+return httpParser

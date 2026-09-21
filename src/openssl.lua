@@ -1,14 +1,14 @@
--- OpenSSL bindings for LuaJIT (vendored libssl + libcrypto).
---
--- The Session class is built for async I/O: it uses memory BIOs, so TLS
--- never touches a socket directly. Encrypted bytes from the peer go in via
--- feed()/decrypt(); plaintext goes out via encrypt(); ciphertext waiting to
--- be written to the wire is pulled with drain(). This is the standard way to
--- drive TLS from an io_uring event loop.
---
+-- OpenSSL bindings for LuaJIT (system libssl/libcrypto). Sessions use memory
+-- BIOs, so TLS never touches a socket: feed()/decrypt() take ciphertext in,
+-- encrypt()/drain() produce it out, all driven by the same ring.
 -- The Lua API is camelCase; raw symbols stay reachable as `lib`.
 
 local ffi = require("ffi")
+local bit = require("bit")
+
+---@class BIO opaque OpenSSL BIO handle
+---@class SSL opaque OpenSSL SSL handle
+---@class SSL_CTX opaque OpenSSL context handle
 
 ffi.cdef [[
   typedef struct ssl_st SSL;
@@ -118,25 +118,26 @@ end
 
 -- ── Context ─────────────────────────────────────────────────────────────────
 
----@class ssl.Context
+---@class superfast.ssl.Context
 ---@field ctx SSL_CTX
 local Context = {}
 Context.__index = Context
 
 --- Create a client TLS context (no cert/key; used by the test suite to
 --- speak TLS to a server without verifying it).
----@return ssl.Context|nil, string?
+---@return superfast.ssl.Context|nil, string?
 function Context.client()
 	local ctx = lib.SSL_CTX_new(lib.TLS_client_method())
 	if ctx == nil then return nil, "SSL_CTX_new failed" end
 	lib.SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, bit.bor(SSL_OP_NO_SSLv2, SSL_OP_NO_SSLv3), nil)
-	return setmetatable({ ctx = ctx }, Context)
+	local obj = setmetatable({ ctx = ctx }, Context)
+	return obj, nil
 end
 
 --- Create a server TLS context and load the certificate chain + private key.
 ---@param certFile string PEM certificate chain
 ---@param keyFile string PEM private key
----@return ssl.Context|nil, string?
+---@return superfast.ssl.Context|nil, string?
 function Context.new(certFile, keyFile)
 	local ctx = lib.SSL_CTX_new(lib.TLS_server_method())
 	if ctx == nil then return nil, "SSL_CTX_new failed" end
@@ -167,7 +168,8 @@ function Context.new(certFile, keyFile)
 	lib.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil)
 	lib.SSL_CTX_ctrl(ctx, SSL_CTRL_MODE, bit.bor(SSL_MODE_AUTO_RETRY, SSL_MODE_RELEASE_BUFFERS), nil)
 
-	return setmetatable({ ctx = ctx }, Context)
+	local obj = setmetatable({ ctx = ctx }, Context)
+	return obj, nil
 end
 
 --- Free the context.
@@ -183,7 +185,7 @@ end
 local readBuf = ffi.new("char[65536]")
 local plainBuf = ffi.new("char[65536]")
 
----@class ssl.Session
+---@class superfast.ssl.Session
 ---@field ssl SSL
 ---@field rbio BIO incoming encrypted bytes from the peer
 ---@field wbio BIO outgoing encrypted bytes waiting to be sent
@@ -191,9 +193,9 @@ local plainBuf = ffi.new("char[65536]")
 local Session = {}
 Session.__index = Session
 
----@param ctx ssl.Context
+---@param ctx superfast.ssl.Context
 ---@param isClient boolean
----@return ssl.Session
+---@return superfast.ssl.Session
 local function newSession(ctx, isClient)
 	local ssl = lib.SSL_new(ctx.ctx)
 	local rbio = crypto.BIO_new(crypto.BIO_s_mem())
@@ -209,20 +211,19 @@ local function newSession(ctx, isClient)
 end
 
 --- Wrap a fresh SSL object with memory BIOs, in server (accept) mode.
----@param ctx ssl.Context
----@return ssl.Session
+---@param ctx superfast.ssl.Context
+---@return superfast.ssl.Session
 function Session.new(ctx)
 	return newSession(ctx, false)
 end
 
 --- Same, but in client (connect) mode.
----@param ctx ssl.Context
----@return ssl.Session
+---@param ctx superfast.ssl.Context
+---@return superfast.ssl.Session
 function Session.newClient(ctx)
 	return newSession(ctx, true)
 end
 
----@param s ssl.Session
 function Session:free()
 	if self.ssl then
 		lib.SSL_free(self.ssl)
@@ -231,9 +232,8 @@ function Session:free()
 end
 
 --- Feed encrypted bytes received from the peer into the read BIO.
----@param s ssl.Session
 ---@param data string
----@return boolean, string?
+---@return boolean|nil, string?
 function Session:feed(data)
 	if data == "" then return true end
 	local n = crypto.BIO_write(self.rbio, data, #data)
@@ -242,10 +242,9 @@ function Session:feed(data)
 end
 
 --- Feed encrypted bytes from a cdata buffer (e.g. a recv buffer) — no copy.
----@param s ssl.Session
----@param ptr cdata char*
+---@param ptr superfast.raw.Buffer char*
 ---@param len integer
----@return boolean, string?
+---@return boolean|nil, string?
 function Session:feedPtr(ptr, len)
 	if len == 0 then return true end
 	local n = crypto.BIO_write(self.rbio, ptr, len)
@@ -255,7 +254,6 @@ end
 
 --- Pull all encrypted bytes the SSL layer has produced so far (to be sent to
 --- the peer), resetting the write BIO.
----@param s ssl.Session
 ---@return string
 function Session:drain()
 	local pending = tonumber(crypto.BIO_ctrl_pending(self.wbio))
@@ -268,7 +266,6 @@ end
 --- Drive the handshake. Returns one of:
 ---   "done", "wantRead" (need more peer bytes), "wantWrite" (drain() has
 ---   more bytes to send, then call handshake() again), or nil + error.
----@param s ssl.Session
 ---@return string|nil, string?
 function Session:handshake()
 	local ret = lib.SSL_do_handshake(self.ssl)
@@ -280,7 +277,6 @@ function Session:handshake()
 end
 
 --- Decrypt as much as possible into a Lua string.
----@param s ssl.Session
 ---@return string plaintext
 ---@return boolean eof peer sent close_notify
 function Session:decrypt()
@@ -305,9 +301,8 @@ function Session:decrypt()
 end
 
 --- Encrypt a plaintext message; ciphertext is available via drain().
----@param s ssl.Session
 ---@param plain string
----@return boolean, string?
+---@return boolean|nil, string?
 function Session:encrypt(plain)
 	if plain == "" then return true end
 	local ret = lib.SSL_write(self.ssl, plain, #plain)
@@ -318,21 +313,18 @@ function Session:encrypt(plain)
 end
 
 --- How many encrypted bytes from the peer are still unprocessed.
----@param s ssl.Session
 ---@return integer
 function Session:pendingEncrypted()
-	return tonumber(crypto.BIO_ctrl_pending(self.rbio))
+	return tonumber(crypto.BIO_ctrl_pending(self.rbio)) or 0
 end
 
 --- Send close_notify; returns the ciphertext to transmit before closing.
----@param s ssl.Session
 ---@return string
 function Session:shutdown()
 	lib.SSL_shutdown(self.ssl)
 	return self:drain()
 end
 
----@param s ssl.Session
 ---@return string
 function Session:errorString()
 	return errString()
@@ -340,15 +332,23 @@ end
 
 -- ── exports ─────────────────────────────────────────────────────────────────
 
-local ssl = {}
+--- The OpenSSL bindings module.
+---@class superfast.ssl
+---@field Context superfast.ssl.Context
+---@field Session superfast.ssl.Session
+---@field lib table<string, function>
+---@field version fun(): string
+---@field SSL_ERROR_WANT_READ integer
+---@field SSL_ERROR_WANT_WRITE integer
 
-ssl.Context   = Context
-ssl.Session   = Session
-ssl.lib       = lib
-ssl.version   = function() return ffi.string(lib.OpenSSL_version(0)) end
-
--- raw constants (used by the server)
-ssl.SSL_ERROR_WANT_READ  = SSL_ERROR_WANT_READ
-ssl.SSL_ERROR_WANT_WRITE = SSL_ERROR_WANT_WRITE
+---@type superfast.ssl
+local ssl = {
+	Context              = Context,
+	Session              = Session,
+	lib                  = lib,
+	version              = function() return ffi.string(lib.OpenSSL_version(0)) end,
+	SSL_ERROR_WANT_READ  = SSL_ERROR_WANT_READ,
+	SSL_ERROR_WANT_WRITE = SSL_ERROR_WANT_WRITE,
+}
 
 return ssl

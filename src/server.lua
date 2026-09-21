@@ -15,6 +15,7 @@
 --     fully async over the same io_uring ops.
 
 local ffi = require("ffi")
+local bit = require("bit")
 local uring = require("superfast.io_uring")
 local Parser = require("superfast.http_parser")
 local sslmod  -- loaded lazily, only when TLS is configured
@@ -48,6 +49,22 @@ local SOCK_STREAM = 1
 local SOL_SOCKET = 1
 local SO_REUSEADDR = 2
 local SO_REUSEPORT = 15
+
+-- errno values the recv path reacts to
+local ENOBUFS = 105
+
+-- fcntl / send / recv flags used by the warmup path
+local F_GETFL = 3
+local F_SETFL = 4
+local O_NONBLOCK = 2048
+local MSG_DONTWAIT = 64
+local MSG_NOSIGNAL = 16384
+local EAGAIN = 11
+local EINTR = 4
+-- Warmup waits only ever have to cover one round trip of a throwaway connection
+-- on loopback; a full millisecond per idle step made startup cost tens of
+-- milliseconds that the first real client pays for.
+local WARMUP_STEP_MS = 0.1
 
 -- user_data ids
 local ID_LISTENER = 0
@@ -125,30 +142,32 @@ local function responseHead(sl, closeConn, bodyLen)
 end
 
 ---@class superfast.Server
----@field ring uring.Ring
+---@field ring superfast.uring.Ring?
 ---@field listenFd integer
----@field handler function
+---@field handler superfast.Handler|fun(): superfast.HandlerResult
+---@field handlerTakesReq boolean
+---@field port integer
+---@field host string
+---@field backlog integer
+---@field entries integer
+---@field bufferCount integer
+---@field maxBuffers integer
+---@field bufferSize integer
+---@field warmup boolean|integer?
+---@field warmupHandler superfast.Handler?
 ---@field conns table<integer, table>
 ---@field nextId integer
----@field buffers table<integer, cdata>
----@field bufferCount integer
----@field bufferSize integer
+---@field nextBid integer
+---@field buffers table<integer, superfast.raw.Buffer>
 ---@field providePending integer
----@field tls ssl.Context|nil
+---@field buffersInKernel integer
+---@field tlsCtx superfast.ssl.Context?
 ---@field running boolean
 local Server = {}
 Server.__index = Server
 
----@param opts table
----  - `port`: integer (default 8080)
----  - `host`: string (default "0.0.0.0")
----  - `handler`: fun(req: httpParser.Request): table|(integer, table?, string?) — required
----  - `backlog`: integer (default 1024)
----  - `bufferCount`: integer provided recv buffers (default 256)
----  - `bufferSize`: integer bytes per buffer (default 16384)
----  - `entries`: integer io_uring SQ depth (default 2048)
----  - `certFile` / `keyFile`: enable TLS
----@return superfast.Server|nil, string?
+---@param opts superfast.Options
+---@return superfast.Server?, string?
 function Server:new(opts)
 	opts = opts or {}
 	if not opts.handler then return nil, "Server requires a handler" end
@@ -166,30 +185,41 @@ function Server:new(opts)
 	local info = debug.getinfo(opts.handler, "u")
 	local takesReq = not (info.nparams == 0 and not info.isvararg)
 
-	return setmetatable({
+	local entries = opts.entries or 2048
+	local bufferCount = opts.bufferCount or 256
+	-- one provided buffer per queued SQE must fit in the ring
+	if bufferCount > entries - 32 then bufferCount = entries - 32 end
+
+	local server = setmetatable({
 		port           = opts.port or 8080,
 		host           = opts.host or "0.0.0.0",
 		handler        = opts.handler,
 		handlerTakesReq = takesReq,
 		backlog        = opts.backlog or 1024,
-		bufferCount    = opts.bufferCount or 256,
+		bufferCount    = bufferCount,
+		maxBuffers     = opts.maxBuffers or 2048,
 		bufferSize     = opts.bufferSize or 16384,
-		entries        = opts.entries or 2048,
+		entries        = entries,
+		warmup         = opts.warmup,
+		warmupHandler  = opts.warmupHandler,
 		tlsCtx         = tlsCtx,
 		ring           = nil,
 		listenFd       = -1,
 		conns          = {},
 		nextId         = 1,
 		buffers        = {},
+		nextBid        = 0,
 		providePending = 0,
+		buffersInKernel = 0,
 		running        = false,
 	}, Server)
+	return server, nil
 end
 
 -- ── setup ───────────────────────────────────────────────────────────────────
 
 --- Create the listening socket. Returns ok, err or ok, port.
----@return boolean, string?|integer?
+---@return boolean, string|integer?
 function Server:listen()
 	local fd = ffi.C.socket(AF_INET, SOCK_STREAM, 0)
 	if fd < 0 then return false, "socket() failed" end
@@ -242,40 +272,279 @@ function Server:listen()
 		return false, "buffer pool setup failed"
 	end
 
+	-- Warmup: LuaJIT compiles by hot counters, and which shapes get compiled
+	-- depends on how requests arrive, so throughput would otherwise vary with
+	-- load. Runs against a private throwaway listener; the real listener is
+	-- only armed afterwards. See docs/ARCHITECTURE.md.
+	if self.warmup ~= false then
+		local rounds = self.warmup
+		if type(rounds) ~= "number" then rounds = 64 end
+		self:warmupOnPrivateListener(rounds)
+	end
+
 	self.running = true
 	self:armAccept()
 	return true, self.port
 end
 
---- Allocate and provide the receive buffer pool.
+--- Warm up against a throwaway listener so warmup traffic cannot mix with
+--- client traffic.
+---@param rounds integer
+function Server:warmupOnPrivateListener(rounds)
+	local wfd = ffi.C.socket(AF_INET, SOCK_STREAM, 0)
+	if wfd < 0 then return end
+	local addr = ffi.new("sockaddr_in")
+	addr.sin_family = AF_INET
+	addr.sin_port = 0
+	addr.sin_addr = 0x0100007f -- 127.0.0.1
+	if ffi.C.bind(wfd, ffi.cast("sockaddr *", addr), ffi.sizeof("sockaddr_in")) ~= 0
+		or ffi.C.listen(wfd, 64) ~= 0 then
+		ffi.C.close(wfd)
+		return
+	end
+	local len = ffi.new("socklen_t[1]", ffi.sizeof("sockaddr_in"))
+	ffi.C.getsockname(wfd, ffi.cast("sockaddr *", addr), len)
+	local warmPort = ffi.C.ntohs(addr.sin_port)
+
+	local realFd = self.listenFd
+	self.listenFd = wfd            -- accepts land on the throwaway listener
+	self:armAccept()
+	self:warmupTraces(rounds, warmPort)
+	self.listenFd = realFd
+	ffi.C.close(wfd)
+	-- reap the completions the closed warmup listener leaves behind
+	for _ = 1, 8 do self:step(WARMUP_STEP_MS) end
+end
+
+--- Compile the parse/response path without a socket: drives the real
+--- onRequest -> handler -> response chain against a detached connection.
+---@param rounds integer
+function Server:warmupParser(rounds)
+	local conn = {
+		id      = 0,
+		st      = ffi.new("conn_state") --[[@as superfast.raw.ConnState]],
+		outQ    = {},
+		outHead = 1,
+		outTail = 1,
+	}
+	local parser = Parser:new({ onMessageComplete = Server.onParserMessage })
+	parser.owner = conn
+	parser.server = self
+	conn.parser = parser
+
+	local shapes = {
+		"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: superfast/warmup\r\nAccept: */*\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+		"GET / HTTP/1.0\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+		"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc",
+	}
+	for i = 1, rounds do
+		local s = shapes[(i % 5) + 1]
+		parser:feed(s)      -- one request per feed: the unbatched path
+		conn.outQ, conn.outHead, conn.outTail = {}, 1, 1
+		conn.st.outLen = 0
+		parser:feed(s .. s) -- two requests in one buffer: the batched path
+		conn.outQ, conn.outHead, conn.outTail = {}, 1, 1
+		conn.st.outLen = 0
+	end
+	-- materialize every lazy field once, so the metamethod paths compile too
+	local req = parser.req
+	if req then
+		local _ = req.method
+		_ = req.path
+		_ = req.query
+		_ = req.version
+		_ = req.keepAlive
+		_ = req.headers
+		_ = req.body
+	end
+	self:buildResponse(true, 200, nil, "")
+	self:buildResponse(true, 404, { ["Content-Type"] = "text/plain" }, "not found")
+end
+
+--- Connect a non-blocking client socket back to this server's listener.
+---@param self superfast.Server
+---@param port integer
+---@return integer fd or -1
+local function warmupConnect(self, port)
+	local fd = ffi.C.socket(AF_INET, SOCK_STREAM, 0)
+	if fd < 0 then return -1 end
+	local addr = ffi.new("sockaddr_in")
+	addr.sin_family = AF_INET
+	addr.sin_port = ffi.C.htons(port)
+	addr.sin_addr = 0x0100007f -- 127.0.0.1 (little-endian host order)
+	if ffi.C.connect(fd, ffi.cast("sockaddr *", addr), ffi.sizeof("sockaddr_in")) ~= 0 then
+		ffi.C.close(fd)
+		return -1
+	end
+	ffi.C.fcntl(fd, F_SETFL, bit.bor(ffi.C.fcntl(fd, F_GETFL, 0), O_NONBLOCK))
+	return fd
+end
+
+--- One warmup round trip: send, pump the loop a bounded number of times, drain.
+--- Never waits for an exact byte count, so an unusual handler cannot stall it.
+---@param self superfast.Server
+---@param fd integer
+---@param payload string
+---@param rbuf superfast.raw.Buffer
+---@param steps integer how many loop iterations to run for this round
+---@return boolean alive false when the connection died (caller reconnects)
+local function warmupExchange(self, fd, payload, rbuf, steps)
+	local ptr = ffi.cast("const char *", payload)
+	local sent = 0
+	local spins = 0
+	while sent < #payload and spins < 64 do
+		local n = ffi.C.send(fd, ptr + sent, #payload - sent, bit.bor(MSG_DONTWAIT, MSG_NOSIGNAL))
+		if n > 0 then
+			sent = sent + n
+		else
+			local e = ffi.errno()
+			if e ~= EAGAIN and e ~= EINTR then return false end
+			spins = spins + 1
+			self:step(WARMUP_STEP_MS) -- peer not reading yet: wait a little
+		end
+	end
+
+	-- pump the loop: every step submits what the previous one queued, so stop as
+	-- soon as a step finds nothing left to do (the round's work is finished)
+	local idle = 0
+	for _ = 1, steps do
+		local n = self:step(WARMUP_STEP_MS)
+		if n == 0 then
+			idle = idle + 1
+			-- a single empty step just means the kernel has not posted the
+			-- completions for the last submission yet; only stop once several
+			-- steps in a row come up empty
+			if idle >= 3 then break end
+		else
+			idle = 0
+		end
+	end
+
+	-- drain the client side so the socket buffer cannot fill up
+	for _ = 1, 64 do
+		local n = ffi.C.recv(fd, rbuf, 16384, MSG_DONTWAIT)
+		if n > 0 then
+			-- keep draining
+		elseif n == 0 then
+			return false
+		else
+			local e = ffi.errno()
+			if e == EAGAIN or e == EINTR then break end
+			return false
+		end
+	end
+	return true
+end
+
+--- Drive real HTTP round trips through the event loop: accept, recv, dispatch,
+--- response sending and close, for lone requests and pipelines.
+---@param rounds integer
+---@param port integer port to drive the round trips against
+function Server:warmupTraces(rounds, port)
+	if self.tlsCtx then return end -- keep the warmup path plain HTTP
+
+	local rounds = math.max(rounds, 16)
+	self:warmupParser(rounds)
+
+	-- With the default hotloop threshold (56) a warmup has to push hundreds of
+	-- requests through before anything compiles. Lower it for the warmup only,
+	-- so a couple of dozen round trips are enough, then put it back.
+	local jit = require("jit")
+	local eager = pcall(jit.opt.start, "hotloop=2", "hotexit=2")
+
+	-- Warm the socket path with the internal 200 handler: the user handler is
+	-- not invoked here at all (no start-up side effects, no risk of a handler
+	-- that errors or closes the connection derailing the warmup).
+	local realHandler = self.handler
+	if not self.warmupHandler then
+		self.handler = function() return 200, nil, "" end
+	end
+
+	local one = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: superfast/warmup\r\n\r\n"
+	local rbuf = ffi.new("char[?]", 16384)
+	local fd = -1
+	local connects = 0
+
+	-- Cycle through the shapes real traffic produces: a lone request, a pair and
+	-- an 8-deep pipeline. The burst rounds make the loop drain several
+	-- completions per iteration and hand the parser a buffer holding several
+	-- requests, which is what saturated traffic looks like.
+	for i = 1, rounds do
+		if fd < 0 then
+			if connects >= 4 then break end -- listener unreachable: give up quietly
+			connects = connects + 1
+			fd = warmupConnect(self, port)
+			if fd < 0 then break end
+		end
+		local burst = 1
+		if i % 4 == 2 then burst = 2 elseif i % 4 == 0 then burst = 8 end
+		local payload = string.rep(one, burst)
+		if not warmupExchange(self, fd, payload, rbuf, burst + 6) then
+			-- the handler closed the connection (Connection: close, an error
+			-- response, …): start a fresh one and keep warming
+			ffi.C.close(fd)
+			fd = -1
+		end
+	end
+	if fd >= 0 then ffi.C.close(fd) end
+
+	if self.warmupHandler == nil then self.handler = realHandler end
+
+	-- let the server reap the warmup connection(s) before real traffic starts
+	for _ = 1, 16 do
+		if self:step(WARMUP_STEP_MS) == 0 then break end
+	end
+
+	if eager then pcall(jit.opt.start, "hotloop=56", "hotexit=10") end
+end
+
+--- Allocate and provide the initial receive buffer pool.
 ---@return boolean
 function Server:initBuffers()
-	local sqe
-	for i = 0, self.bufferCount - 1 do
+	local n = self.bufferCount
+	for i = 0, n - 1 do
 		self.buffers[i] = ffi.new("char[?]", self.bufferSize)
-		sqe = self:sqe()
+		local sqe = self:sqe()
 		self.ring:prepProvideBuffers(sqe, self.buffers[i], self.bufferSize, 1, 0, i)
 		self.ring:sqeSetData(sqe, ID_PROVIDE)
 		self.providePending = self.providePending + 1
 	end
-	self.ring:submitAndWait(self.providePending)
+	self.nextBid = n
+
+	-- wait for every provide to land before arming the first recv, so the
+	-- pool accounting (buffersInKernel) is exact from the start
+	local pending = self.providePending
+	self.ring:submitAndWait(pending)
+	local seen = 0
+	while seen < pending do
+		local cqe = self.ring:waitCqe()
+		if cqe == nil then return false end
+		seen = seen + 1
+		self.ring:cqeSeen(cqe)
+	end
 	self.providePending = 0
+	self.buffersInKernel = n
 	return true
 end
 
---- Get an SQE, flushing the ring if it is momentarily full.
----@return io_uring_sqe
+--- Get an SQE. The SQ is sized far above what one batch queues, so a full
+--- ring means SQEs leaked somewhere; flush once and fail loudly if that did
+--- not help.
+---@return superfast.raw.Sqe
 function Server:sqe()
-	for _ = 1, 4 do
-		local sqe = self.ring:getSqe()
-		if sqe then return sqe end
-		self.ring:submit()
-	end
-	error("io_uring SQ full")
+	local sqe = self.ring:getSqe()
+	if sqe ~= nil then return sqe end
+	self.ring:submit()
+	sqe = self.ring:getSqe()
+	if sqe == nil then error("io_uring SQ full") end
+	return sqe
 end
 
 ---@param conn table
 function Server:armRecv(conn)
+	if conn.st.inflight ~= INFLIGHT_NONE then return end
 	local sqe = self:sqe()
 	self.ring:prepRecv(sqe, conn.st.fd, nil, 0, 0)
 	self.ring:sqeSetFlags(sqe, uring.SqeFlag.BUFFER_SELECT)
@@ -298,54 +567,117 @@ function Server:reProvide(bid)
 	self.ring:sqeSetData(sqe, ID_PROVIDE)
 end
 
+--- Add `count` more buffers to the provided-buffer pool (used when the pool
+--- runs dry, i.e. there are more concurrent recvs than buffers).
+---@param count integer
+---@return integer added
+function Server:growBuffers(count)
+	local added = 0
+	local nextId = self.nextBid
+	while added < count and nextId < self.maxBuffers do
+		local buf = ffi.new("char[?]", self.bufferSize) --[[@as superfast.raw.Buffer]]
+		self.buffers[nextId] = buf
+		local sqe = self:sqe()
+		self.ring:prepProvideBuffers(sqe, buf, self.bufferSize, 1, 0, nextId)
+		self.ring:sqeSetData(sqe, ID_PROVIDE)
+		self.providePending = self.providePending + 1
+		nextId = nextId + 1
+		added = added + 1
+	end
+	self.nextBid = nextId
+	return added
+end
+
+--- Queue a response. Plain array with head/tail cursors: no shifting, and the
+--- cursors reset to 1 when it drains, so depth-1 queues never grow the table.
+---@param conn table
+---@param bytes string
+local function queueOut(conn, bytes)
+	local t = conn.outTail
+	conn.outQ[t] = bytes
+	conn.outTail = t + 1
+	conn.st.outLen = conn.st.outLen + 1
+end
+
+--- Pop the next queued response (nil when the queue is empty).
+---@param conn table
+---@return string?
+local function popOut(conn)
+	local h = conn.outHead
+	local bytes = conn.outQ[h]
+	if bytes == nil then return nil end
+	conn.outQ[h] = nil
+	h = h + 1
+	if h == conn.outTail then h, conn.outTail = 1, 1 end
+	conn.outHead = h
+	conn.st.outLen = conn.st.outLen - 1
+	return bytes
+end
+
 -- ── event loop ──────────────────────────────────────────────────────────────
 
 --- Run the event loop until Server:stop().
+---
+--- One `io_uring_enter` per iteration: every completion that is already done
+--- is reaped first (no syscall), then a single submit-and-wait pushes the
+--- SQEs those completions queued (recv re-arms, buffer returns, responses)
+--- and blocks until the next completion is available. When work is already
+--- pending the wait returns immediately, so nothing is wasted.
 function Server:run()
 	self.running = true
 	while self.running do
-		self:step(nil)
+		self:serveCq()
+		self.ring:submitAndWait(1)
 	end
 end
 
----@param running boolean
 function Server:stop()
 	self.running = false
 end
 
---- One loop iteration: submit queued work, wait for a completion, drain every
---- completion that is already ready.
----@param timeoutMs number|nil
+--- Reap and dispatch every completion that is already available. Returns the
+--- number handled; the CQ head is advanced as each one is consumed.
+---@return integer
+function Server:serveCq()
+	local ring = self.ring --[[@as superfast.uring.Ring]]
+	local n = ring:cqReadyCount()
+	if n == 0 then return 0 end
+	for _ = 1, n do
+		local cqe = ring:peekCqe()          -- reads the live head (non-nil here)
+		if cqe == nil then break end
+		self:dispatch(cqe)
+		ring:cqeSeen(cqe)                   -- advances it
+	end
+	return n
+end
+
+--- One loop iteration: reap what is ready, then submit + wait.
+---@param timeoutMs number|nil blocking wait when nil, otherwise a deadline
 ---@return integer events handled
 ---@return string? err when timing out
 function Server:step(timeoutMs)
-	self.ring:submit()
-	local cqe, err
+	local n = self:serveCq()
 	if timeoutMs then
-		cqe, err = self.ring:waitCqeTimeout(timeoutMs)
+		local ok, err = self.ring:submitAndWaitTimeout(timeoutMs)
+		if not ok and n == 0 then return 0, err end
 	else
-		cqe, err = self.ring:waitCqe()
+		self.ring:submitAndWait(1)
 	end
-	if not cqe then return 0, err end
-
-	local n = 0
-	repeat
-		self:dispatch(cqe)
-		n = n + 1
-		cqe = self.ring:peekCqe()
-	until cqe == nil
-	return n, nil
+	return n + self:serveCq(), nil
 end
 
----@param cqe io_uring_cqe
+---@param cqe superfast.raw.Cqe
 function Server:dispatch(cqe)
-	local id = self.ring:cqeData(cqe)
-	local res = self.ring:cqeRes(cqe)
+	-- read the completion straight out of the CQ entry: the user data is the
+	-- 64-bit id we attached at submission, so no liburing call is needed here
+	local id = tonumber(cqe.user_data)
+	local res = cqe.res
 
 	if id == ID_LISTENER then
 		self:onAccept(res)
 	elseif id == ID_PROVIDE then
 		self.providePending = self.providePending - 1
+		self.buffersInKernel = self.buffersInKernel + 1
 	else
 		local conn = self.conns[id]
 		if conn then
@@ -359,7 +691,6 @@ function Server:dispatch(cqe)
 			end
 		end
 	end
-	self.ring:cqeSeen(cqe)
 end
 
 ---@param res integer
@@ -372,34 +703,48 @@ function Server:onAccept(res)
 			id       = self.nextId,
 			st       = st,
 			tls      = self.tlsCtx and sslmod.Session.new(self.tlsCtx) or nil,
-			outQueue = {},
+			outQ     = {},
+			outHead  = 1,
+			outTail  = 1,
 			curOut   = nil,
 		}
-		-- parser attached after the table exists so the callback closure
-		-- captures the local `conn` (not the outer nil) — see Lua scoping
-		conn.parser = Parser:new({
-			onMessageComplete = function(req) self:onRequest(conn, req) end,
-		})
+		-- One shared parser callback for every connection: the parser carries
+		-- its owner, so no closure is created per accept (a per-accept FNEW
+		-- aborts JIT traces).
+		local parser = Parser:new({ onMessageComplete = Server.onParserMessage })
+		parser.owner = conn
+		parser.server = self
+		conn.parser = parser
 		self.nextId = self.nextId + 1
 		self.conns[conn.id] = conn
+		-- keep the pool ahead of the connection count instead of letting a
+		-- recv find an empty pool later
+		if self.buffersInKernel < 4 and self.nextBid < self.maxBuffers then
+			self:growBuffers(math.min(64, self.maxBuffers - self.nextBid))
+		end
 		self:armRecv(conn)
 	end
 	-- re-arm regardless (errors like EMFILE are transient)
 	self:armAccept()
 end
 
+--- Shared onMessageComplete: the connection is the parser's owner.
+---@param req superfast.http.Request
+function Server.onParserMessage(req)
+	local p = req.__parser
+	p.server:onRequest(p.owner, req)
+end
+
 -- ── connection handling ─────────────────────────────────────────────────────
 
 ---@param conn table
----@param cqe io_uring_cqe
+---@param cqe superfast.raw.Cqe
 ---@param res integer bytes received
 function Server:onRecv(conn, cqe, res)
 	if res > 0 then
-		local bid = self.ring:cqeBid(cqe)
+		local bid = bit.rshift(tonumber(cqe.flags), 16)
+		self.buffersInKernel = self.buffersInKernel - 1
 		local buf = self.buffers[bid]
-
-		-- parse straight from the recv buffer (the parser copies into its own
-		-- scratch buffer); the TLS path feeds ciphertext without copying too
 		if conn.tls then
 			conn.tls:feedPtr(buf, res)
 			self:driveTls(conn)
@@ -407,6 +752,14 @@ function Server:onRecv(conn, cqe, res)
 			self:afterFeed(conn, conn.parser:feedPtr(buf, res))
 		end
 		self:reProvide(bid)
+	elseif res == -ENOBUFS then
+		-- no provided buffer was available to receive into: grow the pool and
+		-- retry instead of dropping the connection
+		if self:growBuffers(64) == 0 then
+			self:closeConn(conn)
+			return
+		end
+		self:armRecv(conn)
 	else
 		-- res == 0: clean EOF; res < 0: ECONNRESET & friends
 		self:closeConn(conn)
@@ -421,8 +774,7 @@ function Server:driveTls(conn)
 		local handshake, err = conn.tls:handshake()
 		local out = conn.tls:drain()
 		if #out > 0 then
-			conn.outQueue[#conn.outQueue + 1] = out
-			st.outLen = st.outLen + 1
+			queueOut(conn, out)
 			st.continueHandshake = 1
 			self:issueSend(conn)
 			return
@@ -487,13 +839,13 @@ end
 
 --- A complete HTTP request arrived; build and queue the response.
 ---@param conn table
----@param req httpParser.Request
+---@param req superfast.http.Request
 function Server:onRequest(conn, req)
 	self:handleRequest(conn, req)
 end
 
 ---@param conn table
----@param cqe io_uring_cqe
+---@param cqe superfast.raw.Cqe
 ---@param res integer bytes sent
 function Server:onSend(conn, cqe, res)
 	local st = conn.st
@@ -503,15 +855,15 @@ function Server:onSend(conn, cqe, res)
 	end
 	st.curOff = st.curOff + res
 	if st.curOff < st.curOutLen then
-		-- more of this string to send
+		-- partial send: queue the rest, the send stays in flight
 		local sqe = self:sqe()
-		self.ring:prepSend(sqe, st.fd, ffi.cast("const char *", conn.curOut) + st.curOff, st.curOutLen - st.curOff)
+		local out = conn.curOut --[[@as string]]
+		self.ring:prepSend(sqe, st.fd, ffi.cast("const char *", out) + st.curOff, st.curOutLen - st.curOff, MSG_NOSIGNAL)
 		self.ring:sqeSetData(sqe, conn.id)
-		-- inflight stays SEND
 		return
 	end
 	conn.curOut = nil
-	st.inflight = INFLIGHT_NONE -- the send op is complete; allow rearm/close
+	st.inflight = INFLIGHT_NONE -- the send completed: rearm or close is allowed
 	if st.continueHandshake ~= 0 then
 		st.continueHandshake = 0
 		self:driveTls(conn)
@@ -534,12 +886,18 @@ function Server:issueSend(conn)
 		end
 		return
 	end
-	conn.curOut = table.remove(conn.outQueue, 1)
-	st.outLen = st.outLen - 1
+	local out = popOut(conn)
+	if out == nil then return end -- queue drained (defensive: outLen said otherwise)
+	conn.curOut = out
 	st.curOff = 0
-	st.curOutLen = #conn.curOut
+	st.curOutLen = #out
 	local sqe = self:sqe()
-	self.ring:prepSend(sqe, st.fd, ffi.cast("const char *", conn.curOut), st.curOutLen)
+	-- MSG_NOSIGNAL: a send on a reset socket must not raise SIGPIPE and kill
+	-- the process (io_uring runs the send in our own task context).
+	-- The Lua string is passed straight through (LuaJIT hands the C call its
+	-- bytes) and stays reachable as conn.curOut until the send CQE lands — no
+	-- pointer cast, so no per-response cdata allocation.
+	self.ring:prepSend(sqe, st.fd, out, st.curOutLen, MSG_NOSIGNAL)
 	self.ring:sqeSetData(sqe, conn.id)
 	st.inflight = INFLIGHT_SEND
 end
@@ -560,7 +918,7 @@ function Server:onClosed(conn, res)
 	self.conns[conn.id] = nil
 	if conn.tls then conn.tls:free() end
 	conn.parser = nil
-	conn.outQueue = nil
+	conn.outQ = nil
 	conn.curOut = nil
 end
 
@@ -635,7 +993,7 @@ end
 
 --- Handle a complete request: invoke the user handler, queue the response.
 ---@param conn table
----@param req httpParser.Request
+---@param req superfast.http.Request
 function Server:handleRequest(conn, req)
 	local ok, r1, r2, r3
 	if self.handlerTakesReq then
@@ -645,7 +1003,7 @@ function Server:handleRequest(conn, req)
 		ok, r1, r2, r3 = pcall(self.handler)
 	end
 	if not ok then
-		self:sendError(conn, 500, r1)
+		self:sendError(conn, 500, tostring(r1))
 		return
 	end
 
@@ -661,14 +1019,13 @@ function Server:handleRequest(conn, req)
 		end
 		bytes = conn.tls:drain()
 	end
-	conn.outQueue[#conn.outQueue + 1] = bytes
-	conn.st.outLen = conn.st.outLen + 1
+	queueOut(conn, bytes)
 end
 
 --- Queue a plain-text error response and close after it is sent.
 ---@param conn table
 ---@param status integer
----@param msg string
+---@param msg string?
 function Server:sendError(conn, status, msg)
 	local reason = REASONS[status] or "Error"
 	local body = reason .. "\n"
@@ -689,9 +1046,8 @@ function Server:sendError(conn, status, msg)
 		end
 		bytes = conn.tls:drain()
 	end
-	conn.outQueue[#conn.outQueue + 1] = bytes
+	queueOut(conn, bytes)
 	conn.st.closeAfterSend = 1
-	conn.st.outLen = conn.st.outLen + 1
 	self:issueSend(conn)
 end
 

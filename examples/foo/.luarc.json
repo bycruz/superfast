@@ -1,0 +1,10 @@
+{
+	"$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
+	"runtime": {
+		"version": "LuaJIT",
+		"path": ["./target/?.lua", "./target/?/init.lua"]
+	},
+	"workspace": {
+		"library": ["target"]
+	}
+}

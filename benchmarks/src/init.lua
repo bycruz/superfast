@@ -1,14 +1,18 @@
 -- benchmarks: HTTP server comparison suite.
 --
---   cd benchmarks && lde run            run every server
---   SERVERS=node,bun lde run            run a subset
---   DUR=5 lde run                       shorter wrk run (default 10s)
---   THREADS=4 CONNS=128 lde run         different wrk load
---   PIN=2 lde run                       pin every server to one CPU
+--   cd benchmarks && lde run          every server, 3 interleaved trials
+--   SERVERS=node,bun lde run          subset
+--   DUR=5 TRIALS=5 lde run            longer runs, more trials
+--   THREADS=4 CONNS=128 lde run       different load
+--   UNPINNED=1 lde run                nothing pinned (old behaviour)
+--   SRV_PIN=2 WRK_PIN=3,4 lde run     explicit pinning
 --
--- Each benchmark: spawn the server (process library), wait until its port
--- answers, load-test it with wrk (built by build.lua), sample the process
--- tree's memory, then tear the tree down. Results print as an ANSI table.
+-- Fair-comparison guards (see docs/ARCHITECTURE.md and README):
+--   * server pinned to one core, wrk to others, so they cannot collide
+--   * warmup pass plus N interleaved trials, reported as a median and spread
+--   * per-server CPU sampled from /proc: cores used, us/req, req/s per core
+--   * stale listeners detected and refused, idle neighbours SIGSTOPped
+--   * per-core busy time attributed, unexplained busy time warned about
 
 local process = require("process")
 local colors = require("benchmarks.colors")
@@ -32,12 +36,22 @@ ffi.cdef [[
 ]]
 
 -- ── config (env) ────────────────────────────────────────────────────────────
-local DUR      = tonumber(os.getenv("DUR")) or 10
+local DUR      = tonumber(os.getenv("DUR")) or 5
+local TRIALS   = tonumber(os.getenv("TRIALS")) or 3
+local WARMUP   = tonumber(os.getenv("WARMUP")) or 3
 local THREADS  = tonumber(os.getenv("THREADS")) or 2
 local CONNS    = tonumber(os.getenv("CONNS")) or 64
 local PIN      = os.getenv("PIN")
+local UNPINNED = os.getenv("UNPINNED") == "1"
+local NOISE    = os.getenv("NOISE") ~= "0"
 local PORT_BASE = tonumber(os.getenv("PORT_BASE")) or 8091
 local OPENRESTY_PREFIX = os.getenv("OPENRESTY_PREFIX") or (os.getenv("HOME") .. "/openresty")
+
+-- Fair default: server on its own core, wrk on two others. Both sides are
+-- pinned so neither the scheduler nor a stray background process can move
+-- them around mid-run.
+local SRV_PIN = os.getenv("SRV_PIN") or (UNPINNED and nil or PIN or "6")
+local WRK_PIN = os.getenv("WRK_PIN") or (UNPINNED and nil or "1,2")
 
 -- package root (benchmarks/): this file lives at <root>/src/init.lua
 local srcPath = debug.getinfo(1, "S").source:sub(2)
@@ -47,6 +61,7 @@ local WRK = ROOT .. "target/benchmarks/wrk/wrk"
 -- ── small helpers ───────────────────────────────────────────────────────────
 local AF_INET, SOCK_STREAM = 2, 1
 local SIGTERM, SIGKILL = 15, 9
+local SIGCONT, SIGSTOP = 18, 19
 
 --- One TCP connect attempt to 127.0.0.1:port; true when the port answers.
 local function tcpProbe(port)
@@ -81,16 +96,21 @@ local function waitReady(child, port, timeoutSec)
 end
 
 --- Pids listening on a TCP port (any address). Uses /proc/net/tcp (listener
---- inode) + /proc/<pid>/fd symlinks to map inode -> pid.
+--- inode) + /proc/<pid>/fd symlinks to map inode -> pid. Column positions are
+--- read by index instead of a fixed pattern: kernels add fields to this file
+--- over time, and an off-by-one here silently fails to find stale listeners
+--- (which then keep serving the port while a fresh server fails to bind).
 local function portPids(port)
 	local want = string.format(":%04X", port)
 	local inodes = {}
 	local f = io.open("/proc/net/tcp")
 	if f then
 		for line in f:lines() do
-			local la, st, inode = line:match("^%s*%d+:%s*(%S+)%s+%S+%s+(%x+)%s+%S+%s+%S+%s+%S+%s+%S+%s+%S+%s+%d+%s+(%d+)")
-			if la and la:match(want .. "$") and st == "0A" and inode then
-				inodes[inode] = true
+			local col = {}
+			for tok in line:gmatch("%S+") do col[#col + 1] = tok end
+			-- sl local rem st tx:rx tr:tm retrnsmt uid timeout inode ...
+			if col[4] == "0A" and col[2] and col[2]:sub(-5) == want and col[10] then
+				inodes[col[10]] = true
 			end
 		end
 		f:close()
@@ -137,6 +157,40 @@ local function descendants(root)
 	return out
 end
 
+local CLK_TCK = tonumber(io.popen("getconf CLK_TCK"):read("*l")) or 100
+
+--- CPU time (utime+stime, in ticks) and thread count of a process tree.
+---@return integer ticks
+---@return integer threads
+local function treeCpu(root)
+	local ticks, threads = 0, 0
+	for _, pid in ipairs(descendants(root)) do
+		local f = io.open("/proc/" .. pid .. "/stat")
+		if f then
+			local line = f:read("*l")
+			f:close()
+			local rest = line and line:match("%)%s+(.*)")
+			if rest then
+				local i, ut, st = 0, 0, 0
+				for v in rest:gmatch("%S+") do
+					i = i + 1
+					if i == 12 then ut = tonumber(v) elseif i == 13 then st = tonumber(v) end
+				end
+				ticks = ticks + ut + st
+			end
+		end
+		local st = io.open("/proc/" .. pid .. "/status")
+		if st then
+			for line in st:lines() do
+				local n = line:match("^Threads:%s+(%d+)")
+				if n then threads = threads + tonumber(n) break end
+			end
+			st:close()
+		end
+	end
+	return ticks, threads
+end
+
 --- Memory of a process tree: "rss peak" in MB. rss is the sum of VmRSS across
 --- the tree, peak the largest single-process VmHWM (high-water mark).
 local function treeMem(root)
@@ -166,6 +220,16 @@ local function killTree(root, port)
 	end
 end
 
+--- Suspend or resume a whole process tree. Used to keep the servers that are
+--- not currently under test from running anything at all: even an idle node/bun
+--- process has timers and GC threads, and sharing the pinned core with them cost
+--- the server under test a measurable ~7%.
+---@param root integer
+---@param sig integer SIGSTOP or SIGCONT
+local function signalTree(root, sig)
+	for _, pid in ipairs(descendants(root)) do ffi.C.kill(pid, sig) end
+end
+
 --- Find an executable on PATH (returns its path or nil).
 local function findBin(name)
 	local path = os.getenv("PATH") or ""
@@ -177,10 +241,14 @@ local function findBin(name)
 	return nil
 end
 
---- Spawn a server binary, optionally under taskset when PIN is set.
-local function spawnServer(bin, argv, opts)
-	if PIN then
-		return process.spawn("taskset", { "-c", PIN, bin, unpack(argv) }, opts)
+--- Spawn a server binary, optionally under taskset when a CPU list is given.
+---@param bin string
+---@param argv string[]
+---@param opts table
+---@param cpus string? taskset CPU list
+local function spawnServer(bin, argv, opts, cpus)
+	if cpus then
+		return process.spawn("taskset", { "-c", cpus, bin, unpack(argv) }, opts)
 	end
 	return process.spawn(bin, argv, opts)
 end
@@ -201,6 +269,57 @@ local function parseWrk(out)
 	return reqs, p50, p99, errors
 end
 
+-- ── per-core interference check ─────────────────────────────────────────────
+--- Busy percentage of every CPU since the last call (from /proc/stat).
+local function cpuBusySnapshot()
+	local t = {}
+	local f = io.open("/proc/stat")
+	if not f then return t end
+	for line in f:lines() do
+		local cpu, vals = line:match("^(cpu%d+)%s+(.+)$")
+		if cpu then
+			local tot, idle, i = 0, 0, 0
+			for v in vals:gmatch("%d+") do
+				v = tonumber(v); tot = tot + v; i = i + 1
+				if i == 4 or i == 5 then idle = idle + v end
+			end
+			t[cpu] = { tot = tot, idle = idle }
+		end
+	end
+	f:close()
+	return t
+end
+
+--- Busy% per cpu id between two snapshots, as a table.
+local function cpuBusyBetween(a, b)
+	local out = {}
+	for cpu, av in pairs(a) do
+		local bv = b[cpu]
+		if bv then
+			local dt = bv.tot - av.tot
+			if dt > 0 then out[cpu] = 100 * (dt - (bv.idle - av.idle)) / dt end
+		end
+	end
+	return out
+end
+
+--- Number of CPUs in a comma-separated list.
+local function countCpus(cpuList)
+	local n = 0
+	for _ in (cpuList or ""):gmatch("[^,]+") do n = n + 1 end
+	return n
+end
+
+--- Highest busy% across a comma-separated CPU list.
+local function worstBusy(busy, cpuList)
+	local worst = 0
+	for c in (cpuList or ""):gmatch("[^,]+") do
+		local v = busy["cpu" .. c]
+		if v and v > worst then worst = v end
+	end
+	return worst
+end
+
 -- ── the servers ─────────────────────────────────────────────────────────────
 local servers = {
 	{
@@ -211,7 +330,7 @@ local servers = {
 				cwd = ROOT .. "servers/node",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -222,7 +341,7 @@ local servers = {
 				cwd = ROOT .. "servers/bun",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -233,7 +352,7 @@ local servers = {
 				cwd = ROOT .. "servers/superfast",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -244,7 +363,7 @@ local servers = {
 				cwd = ROOT .. "servers/python",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -280,7 +399,7 @@ local servers = {
 					OPENRESTY_PREFIX = OPENRESTY_PREFIX,
 				},
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -296,7 +415,7 @@ local servers = {
 				cwd = ROOT .. "servers/express",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -312,7 +431,7 @@ local servers = {
 				cwd = ROOT .. "servers/elysia",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -328,7 +447,7 @@ local servers = {
 				cwd = ROOT .. "servers/hono",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	},
 	{
@@ -339,66 +458,155 @@ local servers = {
 				cwd = ROOT .. "servers/just-js",
 				env = { PORT = tostring(port) },
 				stdout = "null", stderr = "pipe",
-			})
+			}, SRV_PIN)
 		end,
 	}
 }
 
--- ── run one server ──────────────────────────────────────────────────────────
----@return table result { reqs?, p50?, p99?, errors?, rss?, peak?, skipped? }
-local function runServer(srv)
-	local skip = function(msg) return { skipped = msg } end
+-- ── running one server ──────────────────────────────────────────────────────
 
-	-- free the port from any stale listener (a previous crashed run)
+--- Start a server and wait for its port. Returns the child or a skip reason.
+local function bootServer(srv)
 	for _, p in ipairs(portPids(srv.port)) do ffi.C.kill(p, SIGKILL) end
-
-	if not srv.check() then return skip("not installed") end
-
+	if not srv.check() then return nil, "not installed" end
 	local child, err = srv.start(srv.port)
-	if not child then return skip("spawn failed: " .. tostring(err)) end
-
-	local ready, exitCode = waitReady(child, srv.port, 90)
+	if not child then return nil, "spawn failed: " .. tostring(err) end
+	local ready, exitCode = waitReady(child, srv.port, 120)
+	if ready then
+		-- Make sure the thing answering on this port is the server we just
+		-- started: if a stale instance from an earlier run still owns it, the
+		-- numbers below would describe that process instead.
+		local owners = portPids(srv.port)
+		local mine = {}
+		for _, pid in ipairs(descendants(child.pid)) do mine[pid] = true end
+		local foreign = {}
+		for _, pid in ipairs(owners) do
+			if not mine[pid] then foreign[#foreign + 1] = pid end
+		end
+		if #foreign > 0 then
+			killTree(child.pid, nil)
+			child:wait()
+			for _, pid in ipairs(foreign) do ffi.C.kill(pid, SIGKILL) end
+			ffi.C.usleep(300000)
+			return nil, "port " .. srv.port .. " was served by pid(s) " .. table.concat(foreign, ",")
+				.. " (stale listener killed, re-run)"
+		end
+	end
 	if not ready then
 		local _, so, se = child:wait()
 		killTree(child.pid, srv.port)
 		local detail = (se or so or ""):gsub("[\r\n]+", " "):sub(1, 120)
-		return skip("failed to start" .. (exitCode and (" (exit " .. exitCode .. ")") or "")
-			.. (detail ~= "" and (": " .. detail) or ""))
+		return nil, "failed to start" .. (exitCode and (" (exit " .. exitCode .. ")") or "")
+			.. (detail ~= "" and (": " .. detail) or "")
 	end
+	return child, nil
+end
 
-	local url = "http://127.0.0.1:" .. srv.port .. "/"
-	-- Run wrk async and poll both children: drains the server's stderr pipe
-	-- during the load (a chatty server would otherwise block on a full pipe
-	-- and collapse its throughput).
-	local wrkChild, werr = process.spawn(WRK, {
-		"-t" .. THREADS, "-c" .. CONNS, "-d" .. DUR .. "s", "--latency", url,
-	}, { stdout = "pipe", stderr = "pipe" })
-	if not wrkChild then
-		killTree(child.pid, srv.port)
-		return skip("wrk spawn failed: " .. tostring(werr))
+--- Run one wrk pass, returning reqs, p50, p99, errors and the wrk process CPU.
+---@return table|nil result, string? err
+local function wrkPass(port, duration)
+	local url = "http://127.0.0.1:" .. port .. "/"
+	local argv = { "-t" .. THREADS, "-c" .. CONNS, "-d" .. duration .. "s", "--latency", url }
+	local wcmd = WRK
+	local wargv = argv
+	if WRK_PIN then
+		wargv = { "-c", WRK_PIN, WRK, unpack(argv) }
+		wcmd = "taskset"
 	end
-	local wcode
-	while true do
-		wcode = wrkChild:poll()
-		child:poll()
-		if wcode ~= nil then break end
+	local child, werr = process.spawn(wcmd, wargv, { stdout = "pipe", stderr = "pipe" })
+	if not child then return nil, "wrk spawn failed: " .. tostring(werr) end
+	-- wrk's CPU has to be sampled while it is still alive: a finished process
+	-- has no /proc entry left to read, which would report 0 and hide the fact
+	-- that the load generator — not the server — was the bottleneck.
+	local first = treeCpu(child.pid)
+	local peak = first
+	while child:poll() == nil do
+		local t = treeCpu(child.pid)
+		if t > peak then peak = t end
 		ffi.C.usleep(20000)
 	end
-	local _, out, errout = wrkChild:wait()
-
+	local before, after = first, peak
+	local _, out, errout = child:wait()
 	local reqs, p50, p99, errors = parseWrk(out or "")
 	if not reqs then
-		killTree(child.pid, srv.port)
-		local _, _, se = child:wait()
-		local detail = (errout or se or ""):gsub("[\r\n]+", " "):sub(1, 120)
-		return skip("wrk failed" .. (detail ~= "" and (": " .. detail) or ""))
+		return nil, "wrk failed" .. ((errout or ""):gsub("[\r\n]+", " "):sub(1, 100))
 	end
+	return {
+		reqs = reqs, p50 = p50, p99 = p99, errors = errors,
+		wrkCores = (after - before) / CLK_TCK / duration,
+	}
+end
 
+--- Run `fn` with every other live server suspended.
+local function exclusively(live, entry, fn)
+	for _, other in ipairs(live) do
+		if other ~= entry then signalTree(other.child.pid, SIGSTOP) end
+	end
+	local ok, a, b = pcall(fn)
+	for _, other in ipairs(live) do
+		if other ~= entry then signalTree(other.child.pid, SIGCONT) end
+	end
+	if not ok then error(a) end
+	return a, b
+end
+
+--- One measured pass: wrk for DUR seconds with the server's CPU accounted.
+---@return table|nil trial, string? err
+local function measuredPass(srv, child)
+	local busyBefore = cpuBusySnapshot()
+	local cpu0 = treeCpu(child.pid)
+	local r, err = wrkPass(srv.port, DUR)
+	local cpu1 = treeCpu(child.pid)
+	local busyAfter = cpuBusySnapshot()
+	if not r then return nil, err end
+	r.cores = (cpu1 - cpu0) / CLK_TCK / DUR
+	r.usPerReq = (r.cores * 1e6) / r.reqs
+	r.perCore = r.cores > 0 and (r.reqs / r.cores) or 0
+	-- Interference = busy time on our own pinned cores that is NOT us. Our own
+	-- share is approximated from the CPU we measured for the server and wrk.
+	local busy = cpuBusyBetween(busyBefore, busyAfter)
+	local ownSrv = math.min(100, countCpus(SRV_PIN) > 0 and (r.cores / countCpus(SRV_PIN)) * 100 or 0)
+	local ownWrk = math.min(100, countCpus(WRK_PIN) > 0 and (r.wrkCores / countCpus(WRK_PIN)) * 100 or 0)
+	r.noise = math.max(0, math.max(
+		worstBusy(busy, SRV_PIN or "") - ownSrv,
+		worstBusy(busy, WRK_PIN or "") - ownWrk))
+	return r, nil
+end
+
+--- Median of a numeric field over the trials.
+local function median(trials, field)
+	local v = {}
+	for _, t in ipairs(trials) do v[#v + 1] = t[field] end
+	table.sort(v)
+	return v[math.floor(#v / 2) + 1]
+end
+
+--- Collapse the trials of one server into a result row.
+local function aggregate(trials, child)
 	local rss, peak = treeMem(child.pid)
-	killTree(child.pid, srv.port)
-	child:wait() -- reap
-
-	return { reqs = reqs, p50 = p50, p99 = p99, errors = errors, rss = rss, peak = peak }
+	local out = {
+		reqs = median(trials, "reqs"),
+		cores = median(trials, "cores"),
+		usPerReq = median(trials, "usPerReq"),
+		perCore = median(trials, "perCore"),
+		p50 = median(trials, "p50"),
+		p99 = median(trials, "p99"),
+		wrkCores = median(trials, "wrkCores"),
+		noise = 0,
+		errors = 0,
+		best = trials[1].reqs,
+		worst = trials[1].reqs,
+		trials = {},
+		rss = rss, peak = peak,
+	}
+	for i, t in ipairs(trials) do
+		out.trials[i] = t.reqs
+		out.errors = out.errors + t.errors
+		if t.reqs > out.best then out.best = t.reqs end
+		if t.reqs < out.worst then out.worst = t.reqs end
+		if t.noise > out.noise then out.noise = t.noise end
+	end
+	return out
 end
 
 -- ── the table ───────────────────────────────────────────────────────────────
@@ -408,21 +616,29 @@ local function comma(n)
 end
 
 local function render(results)
-	local headers = { "server", "req/s", "p50", "p99", "errors", "rss(MB)", "peak(MB)" }
-	local rows = {} -- { ok = bool, cells = string[], skipMsg = string? }
-	local best = 0
+	local headers = { "server", "req/s (median)", "spread", "cores", "us/req", "req/s per core", "p50", "p99", "errors", "rss(MB)" }
+	local rows = {}
+	local best, bestNorm = 0, 0
 	for _, srv in ipairs(servers) do
 		local r = results[srv.name]
 		if r and r.reqs then
 			if r.reqs > best then best = r.reqs end
+			if r.perCore > bestNorm then bestNorm = r.perCore end
 			rows[#rows + 1] = {
 				ok = true,
-				cells = { srv.name, comma(r.reqs), r.p50, r.p99, tostring(r.errors), tostring(r.rss), tostring(r.peak) },
+				cells = {
+					srv.name, comma(r.reqs),
+					string.format("%.0f-%.0f", r.reqs, r.best),
+					string.format("%.2f", r.cores),
+					string.format("%.2f", r.usPerReq),
+					comma(r.perCore),
+					r.p50, r.p99, tostring(r.errors), tostring(r.rss),
+				},
 			}
-		else
+		elseif not r or r.skipped ~= "excluded" then
 			rows[#rows + 1] = {
 				ok = false,
-				cells = { srv.name, "--", "--", "--", "--", "--", "--" },
+				cells = { srv.name, "--", "--", "--", "--", "--", "--", "--", "--", "--" },
 				skipMsg = (r and r.skipped) or "unknown error",
 			}
 		end
@@ -440,16 +656,17 @@ local function render(results)
 		if i == 1 then return string.format("%-" .. widths[i] .. "s", c) end
 		return string.format("%" .. widths[i] .. "s", c)
 	end
+	local line = function(cells)
+		local parts = {}
+		for i, c in ipairs(cells) do parts[i] = pad(i, c) end
+		return table.concat(parts, "  ")
+	end
 
 	local out = {}
-	out[#out + 1] = colors.paint("bold", colors.paint("cyan", table.concat({
-		pad(1, headers[1]), pad(2, headers[2]), pad(3, headers[3]), pad(4, headers[4]),
-		pad(5, headers[5]), pad(6, headers[6]), pad(7, headers[7]),
-	}, "  ")))
-	out[#out + 1] = colors.paint("dim", string.rep("-", 68))
+	out[#out + 1] = colors.paint("bold", colors.paint("cyan", line(headers)))
+	out[#out + 1] = colors.paint("dim", string.rep("-", 96))
 	for _, row in ipairs(rows) do
-		local joined = table.concat({ pad(1, row.cells[1]), pad(2, row.cells[2]), pad(3, row.cells[3]),
-			pad(4, row.cells[4]), pad(5, row.cells[5]), pad(6, row.cells[6]), pad(7, row.cells[7]) }, "  ")
+		local joined = line(row.cells)
 		if not row.ok then
 			out[#out + 1] = colors.paint("yellow", joined) .. colors.paint("dim", "  (" .. row.skipMsg .. ")")
 		elseif row.cells[1] == "superfast" then
@@ -473,34 +690,85 @@ do
 	end
 end
 
-print(colors.format("{bold}{cyan}superfast benchmark{reset}  wrk -t" .. THREADS .. " -c" .. CONNS .. " -d" .. DUR .. "s"))
-if PIN then
-	print(colors.format("{dim}servers pinned to CPU {yellow}" .. PIN .. "{reset}"))
+print(colors.format("{bold}{cyan}superfast benchmark{reset}  wrk -t" .. THREADS .. " -c" .. CONNS
+	.. " -d" .. DUR .. "s x" .. TRIALS .. " trials"))
+if SRV_PIN or WRK_PIN then
+	print(colors.format("{dim}servers pinned to {yellow}" .. tostring(SRV_PIN or "-")
+		.. "{reset}{dim}, wrk pinned to {yellow}" .. tostring(WRK_PIN or "-") .. "{reset}"))
 else
-	print(colors.format("{dim}servers unpinned ({yellow}PIN=2{reset}{dim} for a single-core fight){reset}"))
+	print(colors.format("{dim}nothing pinned ({yellow}UNPINNED=1{reset}{dim}) — expect scheduler noise"))
 end
-print()
 
 local results = {}
+local live = {}
 for _, srv in ipairs(servers) do
 	if filter and not filter[srv.name] then
 		results[srv.name] = { skipped = "excluded" }
 	else
-		io.write(colors.format("{dim}› benchmarking {cyan}" .. srv.name .. "{reset} ... "))
+		io.write(colors.format("{dim}> starting {cyan}" .. srv.name .. "{reset} ... "))
 		io.flush()
-		local r = runServer(srv)
-		results[srv.name] = r
-		if r.skipped then
-			print(colors.paint("yellow", "skipped (" .. r.skipped .. ")"))
+		local child, skip = bootServer(srv)
+		if not child then
+			results[srv.name] = { skipped = skip }
+			print(colors.paint("yellow", "skipped (" .. skip .. ")"))
 		else
-			print(colors.paint("green", "done"))
+			wrkPass(srv.port, WARMUP) -- JIT / connection / page-cache warmup, unmeasured
+			live[#live + 1] = { srv = srv, child = child }
+			print(colors.paint("green", "up"))
 		end
 	end
+end
+
+-- Interleaved rounds: every server gets trial N before any gets N+1, so
+-- thermal drift and background load land on all of them equally.
+local trials = {}
+for round = 1, TRIALS do
+	local order = {}
+	for i = 1, #live do order[i] = live[(i + round - 2) % #live + 1] end -- rotate start
+	for _, entry in ipairs(order) do
+		local srv = entry.srv
+		io.write(colors.format("{dim}  round " .. round .. "/" .. TRIALS .. " {cyan}" .. srv.name .. "{reset} ... "))
+		io.flush()
+		local r, err = exclusively(live, entry, function() return measuredPass(srv, entry.child) end)
+		if not r then
+			print(colors.paint("yellow", "failed: " .. tostring(err)))
+			entry.failed = true
+			results[srv.name] = { skipped = err }
+		else
+			trials[srv.name] = trials[srv.name] or {}
+			table.insert(trials[srv.name], r)
+			print(colors.format("{dim}" .. comma(r.reqs) .. " req/s, " .. string.format("%.2f", r.cores) .. " cores{reset}"))
+		end
+	end
+end
+
+for _, entry in ipairs(live) do
+	local srv, child = entry.srv, entry.child
+	local t = trials[srv.name]
+	if t and #t == TRIALS then
+		results[srv.name] = aggregate(t, child)
+	end
+	killTree(child.pid, srv.port)
+	child:wait()
 end
 
 print()
 print(render(results))
 print()
-print(colors.format("{dim}rss  = resident set size of the whole process tree at end of run"))
-print(colors.format("{dim}peak = highest single-process RSS (VmHWM) during the run"))
-print(colors.format("{dim}machine note: the powersave governor drifts with thermals; re-run and compare ratios."))
+print(colors.format("{dim}req/s    = median of " .. TRIALS .. " interleaved trials (spread = worst-best)"))
+print(colors.format("{dim}cores    = CPU cores the server process tree actually consumed (utime+stime)"))
+print(colors.format("{dim}us/req   = CPU microseconds per request, all cores included"))
+print(colors.format("{dim}per core = req/s divided by cores used — the machine-noise-proof score"))
+print(colors.format("{dim}rss      = resident set size of the whole process tree at end of run"))
+
+-- interference report: if a pinned core was busy with something else, the
+-- numbers above are optimistic for whoever held it
+local noisy = {}
+for name, r in pairs(results) do
+	if r.noise and NOISE and r.noise > 40 then noisy[#noisy + 1] = name .. " (" .. string.format("%.0f%%", r.noise) .. ")" end
+end
+if #noisy > 0 then
+	print(colors.paint("yellow", "warning") .. colors.paint("dim",
+		": pinned cores saw busy time that was neither the server nor wrk (background load or"
+		.. " interrupt processing) during " .. table.concat(noisy, ", ") .. " - close background apps for tighter numbers"))
+end
