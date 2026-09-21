@@ -7,8 +7,7 @@ Bun.serve({
   port,
   hostname,
   fetch() {
-    // null body -> Content-Length: 0 empty 200, same shape superfast produces
-    return new Response(null, { status: 200 });
+    return new Response();
   },
 });
 
