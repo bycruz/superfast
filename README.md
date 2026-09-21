@@ -7,6 +7,12 @@ An incredibly fast HTTP server for LuaJIT on Linux, built on io_uring.
 
 ## Quick start
 
+Setup [lde](https://lde.sh)
+
+```bash
+lde add superfast
+```
+
 ```lua
 local superfast = require("superfast")
 

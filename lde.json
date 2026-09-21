@@ -1,5 +1,7 @@
 {
 	"name": "superfast",
+	"description": "An incredibly fast HTTP server in pure LuaJIT",
+	"authors": ["David Cruz <david@bycruz.dev>"],
 	"version": "0.1.0",
 	"devDependencies": {
 		"lde-test": { "git": "https://github.com/lde-org/lde" },
