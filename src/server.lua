@@ -16,6 +16,7 @@
 
 local ffi = require("ffi")
 local bit = require("bit")
+local jit = require("jit")
 local uring = require("superfast.io_uring")
 local Parser = require("superfast.http_parser")
 local sslmod  -- loaded lazily, only when TLS is configured
@@ -52,6 +53,11 @@ local SO_REUSEPORT = 15
 
 -- errno values the recv path reacts to
 local ENOBUFS = 105
+
+-- Hot reload (`lde run --hot`): how long the loop may block, and how many busy
+-- iterations pass between two polls of the driver (see package.hot.poll).
+local HOT_WAIT_MS = 5
+local HOT_POLL_EVERY = 512
 
 -- fcntl / send / recv flags used by the warmup path
 local F_GETFL = 3
@@ -146,6 +152,8 @@ end
 ---@field listenFd integer
 ---@field handler superfast.Handler|fun(): superfast.HandlerResult
 ---@field handlerTakesReq boolean
+---@field hot boolean true under `lde run --hot` (package.hot is present)
+---@field onClose fun()? called by close(): drops the server from the live registry
 ---@field port integer
 ---@field host string
 ---@field backlog integer
@@ -166,6 +174,15 @@ end
 local Server = {}
 Server.__index = Server
 
+--- Handlers that declare no parameters provably cannot touch req (unless
+--- vararg — they could read `...`), so we can skip passing it entirely.
+---@param handler superfast.Handler
+---@return boolean
+local function handlerTakesReq(handler)
+	local info = debug.getinfo(handler, "u")
+	return not (info.nparams == 0 and not info.isvararg)
+end
+
 ---@param opts superfast.Options
 ---@return superfast.Server?, string?
 function Server:new(opts)
@@ -180,10 +197,7 @@ function Server:new(opts)
 		tlsCtx = ctx
 	end
 
-	-- handlers that declare no parameters provably cannot touch req (unless
-	-- vararg — they could read `...`), so we can skip passing it entirely
-	local info = debug.getinfo(opts.handler, "u")
-	local takesReq = not (info.nparams == 0 and not info.isvararg)
+	local hot = rawget(package, "hot") ~= nil
 
 	local entries = opts.entries or 2048
 	local bufferCount = opts.bufferCount or 256
@@ -194,7 +208,9 @@ function Server:new(opts)
 		port           = opts.port or 8080,
 		host           = opts.host or "0.0.0.0",
 		handler        = opts.handler,
-		handlerTakesReq = takesReq,
+		handlerTakesReq = handlerTakesReq(opts.handler),
+		hot            = hot,
+		onClose        = nil,
 		backlog        = opts.backlog or 1024,
 		bufferCount    = bufferCount,
 		maxBuffers     = opts.maxBuffers or 2048,
@@ -276,7 +292,9 @@ function Server:listen()
 	-- depends on how requests arrive, so throughput would otherwise vary with
 	-- load. Runs against a private throwaway listener; the real listener is
 	-- only armed afterwards. See docs/ARCHITECTURE.md.
-	if self.warmup ~= false then
+	--
+	-- warmup only exists to get traces compiled: skip it when the JIT is off
+	if self.warmup ~= false and jit.status() then
 		local rounds = self.warmup
 		if type(rounds) ~= "number" then rounds = 64 end
 		self:warmupOnPrivateListener(rounds)
@@ -451,7 +469,6 @@ function Server:warmupTraces(rounds, port)
 	-- With the default hotloop threshold (56) a warmup has to push hundreds of
 	-- requests through before anything compiles. Lower it for the warmup only,
 	-- so a couple of dozen round trips are enough, then put it back.
-	local jit = require("jit")
 	local eager = pcall(jit.opt.start, "hotloop=2", "hotexit=2")
 
 	-- Warm the socket path with the internal 200 handler: the user handler is
@@ -623,12 +640,39 @@ end
 --- SQEs those completions queued (recv re-arms, buffer returns, responses)
 --- and blocks until the next completion is available. When work is already
 --- pending the wait returns immediately, so nothing is wasted.
+---
+--- In hot mode the wait is bounded and the driver is polled after each
+--- submission, so a loop that never returns still reloads. The poll aborts the
+--- run when a tracked file changed (package.hot.poll).
 function Server:run()
 	self.running = true
+	local waitMs = self.hot and HOT_WAIT_MS or nil
+	local hot = waitMs and rawget(package, "hot") or nil
+	local poll = hot and hot.poll or nil
+	local countdown = 0
 	while self.running do
 		self:serveCq()
-		self.ring:submitAndWait(1)
+		if waitMs then
+			local waited = self.ring:submitAndWaitTimeout(waitMs)
+			-- idle: poll on every wakeup. busy: every HOT_POLL_EVERY.
+			if poll and (not waited or countdown <= 0) then
+				countdown = HOT_POLL_EVERY
+				poll()
+			else
+				countdown = countdown - 1
+			end
+		else
+			self.ring:submitAndWait(1)
+		end
 	end
+end
+
+--- Replace the handler of a running server: hot reload re-runs the entry and
+--- hands over the freshly loaded one. Connections and the ring are untouched.
+---@param handler superfast.Handler
+function Server:setHandler(handler)
+	self.handler = handler
+	self.handlerTakesReq = handlerTakesReq(handler)
 end
 
 function Server:stop()
@@ -1069,6 +1113,11 @@ function Server:close()
 	if self.tlsCtx then
 		self.tlsCtx:free()
 		self.tlsCtx = nil
+	end
+	local onClose = self.onClose
+	if onClose then
+		self.onClose = nil
+		onClose()
 	end
 end
 

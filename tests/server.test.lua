@@ -273,3 +273,40 @@ test.skipIf(ssl == nil)("serves HTTPS with a self-signed cert", function()
 	server:close()
 	os.execute('rm -rf "' .. dir .. '"')
 end)
+
+test.it("setHandler swaps the handler of a live server mid-connection", function()
+	local server, port = startServer(defaultHandler)
+
+	local fd = assert(client.connect("127.0.0.1", port))
+	client.setNonBlocking(fd)
+	local req = "GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+
+	assert(client.sendAll(fd, req))
+	local first = readResponse(server, fd)
+	test.includes(first, "<h1>superfast</h1>")
+
+	-- what hot reload does on a re-run: keep the ring + connections, hand over
+	-- the newly loaded handler. This one takes no argument at all, so it also
+	-- exercises the handler-arity re-computation.
+	server:setHandler(function() return 200, { ["Content-Type"] = "text/plain" }, "reloaded" end)
+
+	assert(client.sendAll(fd, req))
+	local second = readResponse(server, fd)
+	test.includes(second, "HTTP/1.1 200 OK")
+	test.includes(second, "reloaded")
+	test.includes(second, "\r\n\r\nreloaded") -- exactly the new body, no leftovers
+
+	client.close(fd)
+	server:close()
+end)
+
+test.it("hot mode follows package.hot", function()
+	-- without a hot-reloading driver a plain server blocks in the kernel
+	test.falsy(assert(superfast.Server:new({ handler = defaultHandler })).hot)
+
+	rawset(package, "hot", { poll = function() return false end })
+	local hot = assert(superfast.Server:new({ handler = defaultHandler }))
+	rawset(package, "hot", nil)
+	test.truthy(hot.hot)
+end)
+

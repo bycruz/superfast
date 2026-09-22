@@ -36,14 +36,50 @@
 ---@alias superfast.HandlerResult integer|superfast.Response|string|nil
 local Server = require("superfast.server")
 
+-- ── live servers ────────────────────────────────────────────────────────────
+
+-- Servers listening in this process, keyed by "host:port". A hot-reloading
+-- driver re-runs the entry file on every reload, so serve() is called again for
+-- a port that is already bound; adopting the live server swaps the handler and
+-- keeps the connections instead of binding a second listener. Held on _G so a
+-- reload of this module cannot reset it.
+---@type table<string, superfast.Server>
+local liveServers = rawget(_G, "__superfast_live_servers") or {}
+rawset(_G, "__superfast_live_servers", liveServers)
+
 --- Create, listen, and run this server until the process is killed.
+---
+--- Under `lde run --hot` a second call for a served address reuses the live
+--- server: only the handler is replaced, so connections survive the reload.
 ---@param opts superfast.Options
 ---@return superfast.Server?, string?
 local function serve(opts)
+	opts = opts or {}
+	if not opts.handler then return nil, "Server requires a handler" end
+
+	local port = opts.port or 8080
+	local reuse = opts.reuse
+	if reuse == nil then reuse = rawget(package, "hot") ~= nil end
+	-- port 0 means "any free port": those never collide, so they never reuse
+	local key = (reuse and port ~= 0) and ((opts.host or "0.0.0.0") .. ":" .. port) or nil
+
+	if key then
+		local live = liveServers[key]
+		if live then
+			live:setHandler(opts.handler)
+			live:run()
+			return live, nil
+		end
+	end
+
 	local server, err = Server:new(opts)
 	if not server then return nil, err end
-	local ok, port = server:listen()
-	if not ok then return nil, port end
+	local ok, bound = server:listen()
+	if not ok then return nil, bound end
+	if key then
+		liveServers[key] = server
+		server.onClose = function() liveServers[key] = nil end
+	end
 	server:run()
 	return server, nil
 end
@@ -82,6 +118,7 @@ local superfast = {
 ---@field bufferSize integer? bytes per receive buffer (default 16384)
 ---@field warmup boolean|integer? warmup round trips before serving (default 64, false disables)
 ---@field warmupHandler superfast.Handler? handler used for warmup traffic
+---@field reuse boolean? adopt the live server for this address instead of binding a second listener (default: true under `lde run --hot`)
 ---@field certFile string? TLS certificate (enables TLS with keyFile)
 ---@field keyFile string? TLS private key
 
